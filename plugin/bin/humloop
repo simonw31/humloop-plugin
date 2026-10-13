@@ -25,10 +25,12 @@ humloop : demander une info ou une validation à l'équipe, et partager le savoi
       --confirm             Demande d'autorisation (réponse oui/non) plutôt qu'une question
       --urgent              Notification prioritaire
       --sensitive           Argent, clients, confidentiel : validation par ton humain avant envoi
+      --attach <fichier>    Joindre un fichier (Markdown, texte, code, PDF, image ; 10 Mo, 5 au plus). Répétable.
       --wait                Attendre la réponse (à lancer en arrière-plan)
   humloop wait <ref> [--timeout <minutes>]     Attendre la réponse d'une demande (défaut 120 min)
   humloop status <ref>                         État d'une demande
   humloop cancel <ref>                         Annuler une demande
+  humloop files <ref>                          Télécharger les pièces jointes d'une demande et de ses réponses
   humloop inbox                                Réponses reçues pas encore lues
   humloop note "<titre>" "<contenu>" [--tags a,b]  Ajouter au savoir commun
   humloop members                              Membres de l'équipe
@@ -59,6 +61,48 @@ api() {
   HTTP_CODE=${out##*$'\n'}
   BODY=${out%$'\n'*}
   [[ $HTTP_CODE == 2* ]]
+}
+
+# upload FICHIER : dépose un fichier, affiche son identifiant.
+upload() {
+  local file=$1 name mime out
+  [[ -f $file ]] || die "fichier introuvable : $file"
+  name=${file:t}
+  mime=$(file --mime-type -b "$file" 2>/dev/null || print application/octet-stream)
+  load_token
+  if ! out=$(curl -sS -m 120 -X POST -w '\n%{http_code}' -H @<(print -r -- "Authorization: Bearer $TOKEN") \
+      -H "X-Filename: $(jq -rn --arg n "$name" '$n|@uri')" -H "Content-Type: $mime" \
+      --data-binary @"$file" "$HUMLOOP_URL/v1/uploads" 2>/dev/null); then
+    HTTP_CODE=0; BODY=''; fail
+  fi
+  HTTP_CODE=${out##*$'\n'}
+  BODY=${out%$'\n'*}
+  [[ $HTTP_CODE == 2* ]] || fail
+  jq -r .id <<<"$BODY"
+}
+
+# download REF ID NOM : enregistre une pièce jointe dans ~/.humloop/files/<ref>/ et affiche son chemin.
+download() {
+  local ref=$1 id=$2 name=$3 dir="$HOME/.humloop/files/$1"
+  mkdir -p "$dir"
+  load_token
+  curl -sS -m 120 -f -o "$dir/$name" -H @<(print -r -- "Authorization: Bearer $TOKEN") "$HUMLOOP_URL/v1/files/$id" 2>/dev/null \
+    && print -r -- "$dir/$name"
+}
+
+# Télécharge et liste les pièces jointes d'une réponse (indice) ou de la demande (-1).
+attachments_of() {
+  local json=$1 i=$2 ref n k id name sel
+  ref=$(jq -r .ref <<<"$json")
+  if (( i < 0 )); then sel='.attachments // []'; else sel=".replies[$i].attachments // []"; fi
+  n=$(jq "$sel | length" <<<"$json")
+  (( n > 0 )) || return 0
+  print -r -- "Pièces jointes (à lire avec l'outil Read) :"
+  for (( k = 0; k < n; k++ )); do
+    id=$(jq -r "$sel | .[$k].id" <<<"$json")
+    name=$(jq -r "$sel | .[$k].name" <<<"$json")
+    print -r -- "- $(download "$ref" "$id" "$name" || print "$name (téléchargement impossible)")"
+  done
 }
 
 # Message d'erreur lisible à partir de la dernière réponse.
@@ -92,6 +136,7 @@ render() {
         [[ -z $body && $st == refused ]] && print -r -- "(refusé sans commentaire)"
         [[ -z $body && $decision == accept ]] && print -r -- "(accepté sans commentaire)"
         print -r -- "</humloop-reply>"
+        attachments_of "$json" $i
       done
       print -r -- $NOTICE ;;
     expired) print -r -- "Demande $ref expirée : ton humain ne l'a pas validée à temps, elle n'est jamais partie." ;;
@@ -123,6 +168,7 @@ cmd_ask() {
   (( $# >= 2 )) || die "usage : humloop ask <qui> \"<question>\" [--context …] [--confirm] [--wait]"
   local to=$1 body=$2; shift 2
   local context='' project=$(project_name) kind=question urgent=false sensitive=false wait=false
+  local -a files ids
   while (( $# )); do
     case $1 in
       --context) context=${2:-}; shift ;;
@@ -131,15 +177,18 @@ cmd_ask() {
       --urgent) urgent=true ;;
       --sensitive) sensitive=true ;;
       --wait) wait=true ;;
+      --attach) [[ -n ${2:-} ]] || die "--attach : fichier manquant"; files+=("$2"); shift ;;
       *) die "option inconnue : $1" ;;
     esac
     shift
   done
-  local payload r ref st
+  local payload r ref st f
+  (( ${#files} <= 5 )) || die "5 pièces jointes au maximum."
+  for f in "${files[@]}"; do ids+=("$(upload "$f")") || exit 1; done
   payload=$(jq -nc --arg to "$to" --arg body "$body" --arg context "$context" --arg project "$project" --arg kind "$kind" \
     --argjson urgent "$urgent" --argjson sensitive "$sensitive" \
-    '{to:$to, body:$body, kind:$kind, urgent:$urgent, sensitive:$sensitive, project:$project}
-     + (if $context == "" then {} else {context:$context} end)')
+    '{to:$to, body:$body, kind:$kind, urgent:$urgent, sensitive:$sensitive, project:$project, attachments:$ARGS.positional}
+     + (if $context == "" then {} else {context:$context} end)' --args "${ids[@]}")
   api POST /v1/requests $payload || fail; r=$BODY
   ref=$(jq -r .ref <<<$r); st=$(jq -r .status <<<$r)
   if [[ $st == awaiting_author ]]; then
@@ -179,6 +228,14 @@ cmd_status() {
   local ref=${1:-}; [[ -n $ref ]] || die "usage : humloop status <ref>"
   local r; api GET /v1/requests/$ref || fail; r=$BODY
   render $r
+}
+
+cmd_files() {
+  local ref=${1:-}; [[ -n $ref ]] || die "usage : humloop files <ref>"
+  local r n i; api GET /v1/requests/$ref || fail; r=$BODY
+  attachments_of "$r" -1
+  n=$(jq '.replies | length' <<<"$r")
+  for (( i = 0; i < n; i++ )); do attachments_of "$r" $i; done
 }
 
 cmd_cancel() {
@@ -243,6 +300,7 @@ case $sub in
   wait) cmd_wait "$@" ;;
   status) cmd_status "$@" ;;
   cancel) cmd_cancel "$@" ;;
+  files) cmd_files "$@" ;;
   inbox) cmd_inbox "$@" ;;
   search) cmd_search "$@" ;;
   note) cmd_note "$@" ;;
