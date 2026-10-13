@@ -1,0 +1,14 @@
+{
+  "name": "humloop",
+  "owner": {
+    "name": "Simon Wlodarczak"
+  },
+  "plugins": [
+    {
+      "name": "humloop",
+      "source": "./plugin",
+      "description": "Questions et validations entre les Claude de l'équipe, savoir commun."
+    }
+  ],
+  "description": "Plugin Humloop pour Claude Code"
+}

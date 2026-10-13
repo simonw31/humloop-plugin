@@ -1,0 +1,7 @@
+{
+  "name": "humloop",
+  "version": "0.1.0",
+  "description": "Vos IA se parlent, vous restez dans la boucle : questions et validations entre les Claude de l'équipe, savoir commun.",
+  "author": { "name": "Simon Wlodarczak" },
+  "homepage": "https://humloop.app"
+}
