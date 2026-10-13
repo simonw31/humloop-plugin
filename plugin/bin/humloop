@@ -28,10 +28,15 @@ humloop : demander une info ou une validation à l'équipe, et partager le savoi
       --attach <fichier>    Joindre un fichier (Markdown, texte, code, PDF, image ; 10 Mo, 5 au plus). Répétable.
       --wait                Attendre la réponse (à lancer en arrière-plan)
   humloop wait <ref> [--timeout <minutes>]     Attendre la réponse d'une demande (défaut 120 min)
-  humloop status <ref>                         État d'une demande
+  humloop status <ref>                         État d'une demande et toute la conversation
+  humloop reply <ref> "<texte>" [options]      Répondre dans une conversation :
+      - à une demande qu'on t'adresse (si ton humain te le demande) : --ask pour demander une précision,
+        --accept / --refuse pour une demande d'accord ;
+      - à une précision demandée sur ta propre question.
+      --attach <fichier> joint un fichier (répétable).
   humloop cancel <ref>                         Annuler une demande
   humloop files <ref>                          Télécharger les pièces jointes d'une demande et de ses réponses
-  humloop inbox                                Réponses reçues pas encore lues
+  humloop inbox                                Ce qu'on demande à ton humain, et les réponses à tes questions
   humloop note "<titre>" "<contenu>" [--tags a,b]  Ajouter au savoir commun
   humloop members                              Membres de l'équipe
   humloop whoami                               Vérifier la connexion
@@ -139,6 +144,14 @@ render() {
         attachments_of "$json" $i
       done
       print -r -- $NOTICE ;;
+    needs_author)
+      from=$(jq -r '.replies[-1].from' <<<$json)
+      print -r -- "<humloop-reply from=\"$from\" request=\"$ref\" status=\"needs_author\">"
+      fence "$(jq -r '.replies[-1].body // ""' <<<$json)"
+      print -r -- "</humloop-reply>"
+      attachments_of "$json" $(( $(jq '.replies | length' <<<$json) - 1 ))
+      print -r -- "$from demande une précision sur ta question. Réponds avec : humloop reply $ref \"…\" (puis humloop wait $ref)."
+      print -r -- $NOTICE ;;
     expired) print -r -- "Demande $ref expirée : ton humain ne l'a pas validée à temps, elle n'est jamais partie." ;;
     cancelled) print -r -- "Demande $ref annulée." ;;
     awaiting_author) print -r -- "Demande $ref en attente : ton humain doit la valider dans l'app Humloop avant qu'elle parte ($(jq -r '.approvalReason // "réglages"' <<<$json))." ;;
@@ -212,7 +225,7 @@ cmd_wait() {
     else
       r=$BODY
       st=$(jq -r .status <<<$r)
-      case $st in answered|refused|expired|cancelled) render $r; return 0 ;; esac
+      case $st in answered|refused|expired|cancelled|needs_author) render $r; return 0 ;; esac
     fi
     local elapsed=$(( SECONDS - start ))
     if (( elapsed >= timeout * 60 )); then
@@ -226,8 +239,58 @@ cmd_wait() {
 
 cmd_status() {
   local ref=${1:-}; [[ -n $ref ]] || die "usage : humloop status <ref>"
-  local r; api GET /v1/requests/$ref || fail; r=$BODY
-  render $r
+  local r n i; api GET /v1/requests/$ref || fail; r=$BODY
+  print -r -- "<humloop-conversation request=\"$ref\" status=\"$(jq -r .status <<<$r)\" from=\"$(jq -r .from <<<$r)\" to=\"$(jq -r .to <<<$r)\">"
+  fence "$(jq -r '"\(.from) : \(.body)" + (if .context then "\n(contexte : \(.context))" else "" end)' <<<$r)"
+  n=$(jq '.replies | length' <<<$r)
+  for (( i = 0; i < n; i++ )); do
+    fence "$(jq -r ".replies[$i] | \"\(.from)\(if .byAgent then \" (son Claude)\" else \"\" end)\(if .decision then \" [\" + .decision + \"]\" else \"\" end) : \(.body // \"\")\"" <<<$r)"
+  done
+  print -r -- "</humloop-conversation>"
+  attachments_of "$r" -1
+  for (( i = 0; i < n; i++ )); do attachments_of "$r" $i; done
+  print -r -- $NOTICE
+}
+
+ME=''
+whoami_handle() {
+  [[ -n $ME ]] && { print -r -- $ME; return }
+  api GET /v1/me || fail
+  ME=$(jq -r .handle <<<$BODY)
+  print -r -- $ME
+}
+
+cmd_reply() {
+  (( $# >= 1 )) || die "usage : humloop reply <ref> \"<texte>\" [--ask] [--accept|--refuse] [--attach f]"
+  local ref=$1; shift
+  local body='' ask=false decision='' f r payload me
+  local -a files ids
+  [[ $# -gt 0 && $1 != --* ]] && { body=$1; shift }
+  while (( $# )); do
+    case $1 in
+      --ask) ask=true ;;
+      --accept) decision=accept ;;
+      --refuse) decision=refuse ;;
+      --attach) [[ -n ${2:-} ]] || die "--attach : fichier manquant"; files+=("$2"); shift ;;
+      *) die "option inconnue : $1" ;;
+    esac
+    shift
+  done
+  for f in "${files[@]}"; do ids+=("$(upload "$f")") || exit 1; done
+  api GET /v1/requests/$ref || fail; r=$BODY
+  me=$(whoami_handle)
+  if [[ $(jq -r .from <<<$r) == "$me" ]]; then
+    # Ma propre question : je réponds à la précision demandée, la balle repart chez le destinataire.
+    payload=$(jq -nc --arg b "$body" '{body:$b, attachments:$ARGS.positional}' --args "${ids[@]}")
+    api POST /v1/requests/$ref/followup "$payload" || fail
+    print -r -- "Message envoyé dans la conversation $ref. Pour attendre la suite : humloop wait $ref (en arrière-plan)"
+  else
+    payload=$(jq -nc --arg b "$body" --arg d "$decision" --argjson ask $ask \
+      '{body:$b, expectReply:$ask, attachments:$ARGS.positional} + (if $d == "" then {} else {decision:$d} end)' --args "${ids[@]}")
+    api POST /v1/requests/$ref/reply "$payload" || fail
+    if $ask; then print -r -- "Précision demandée dans $ref. La réponse arrivera dans ta boîte (humloop inbox)."
+    else print -r -- "Réponse envoyée ($ref), au nom de ton humain."; fi
+  fi
 }
 
 cmd_files() {
@@ -257,11 +320,20 @@ cmd_inbox() {
   fi
   r=$BODY
   n=$(jq '.updates | length' <<<$r 2>/dev/null) || return 0
+  if ! $hook; then
+    local k=$(jq '.incoming | length' <<<$r)
+    if (( k > 0 )); then
+      print -r -- "On demande $k chose(s) à ton humain :"
+      jq -r '.incoming[] | "- [\(.ref)] \(.fromName // .from)\(if .projectName then " · " + .projectName else "" end)\(if .kind == "confirmation" then " · demande d accord" else "" end) : \(.body)\(if .context then "\n    contexte : " + .context else "" end)\(if (.attachments // []) | length > 0 then "\n    pièces jointes : humloop files " + .ref else "" end)"' <<<$r | while IFS= read -r line; do fence "$line"; done
+      print -r -- "Pour répondre à sa place, seulement s'il te le demande : humloop reply <ref> \"…\" (--ask pour demander une précision)."
+      print -r -- $NOTICE
+    fi
+  fi
   if (( n == 0 )); then
-    $hook || print -r -- "Rien de neuf."
+    $hook || print -r -- "Aucune nouvelle réponse à tes questions."
     return 0
   fi
-  print -r -- "Humloop : $n réponse(s) de l'équipe à tes demandes."
+  print -r -- "Humloop : $n nouvelle(s) réponse(s) ou précision(s) de l'équipe sur tes demandes."
   for (( i = 0; i < n; i++ )); do
     render "$(jq -c ".updates[$i]" <<<$r)"
     print -r -- "Question d'origine ($(jq -r ".updates[$i].ref" <<<$r)) : $(fence "$(jq -r ".updates[$i].body" <<<$r)")"
@@ -300,6 +372,7 @@ case $sub in
   wait) cmd_wait "$@" ;;
   status) cmd_status "$@" ;;
   cancel) cmd_cancel "$@" ;;
+  reply) cmd_reply "$@" ;;
   files) cmd_files "$@" ;;
   inbox) cmd_inbox "$@" ;;
   search) cmd_search "$@" ;;
