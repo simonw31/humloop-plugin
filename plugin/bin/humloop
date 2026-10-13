@@ -19,7 +19,8 @@ usage() {
 humloop : demander une info ou une validation à l'équipe, et partager le savoir commun.
 
   humloop search "<texte>"                     Chercher dans le savoir commun (à faire avant de demander)
-  humloop ask <qui> "<question>" [options]     Poser une question à une personne ou à @equipe
+  humloop ask <qui> "<question>" [options]     Poser une question à une personne, à @equipe, ou à un sujet
+                                               (« seo », « rédaction » : la personne qui en décide dans le projet)
       --context "<texte>"   Contexte pour comprendre la question sans la conversation
       --project <nom>       Projet concerné (par défaut : dossier courant)
       --confirm             Demande d'autorisation (réponse oui/non) plutôt qu'une question
@@ -32,13 +33,18 @@ humloop : demander une info ou une validation à l'équipe, et partager le savoi
   humloop reply <ref> "<texte>" [options]      Répondre dans une conversation :
       - à une demande qu'on t'adresse (si ton humain te le demande) : --ask pour demander une précision,
         --accept / --refuse pour une demande d'accord ;
-      - à une précision demandée sur ta propre question.
+      - à une précision demandée sur ta propre question ;
+      - dans un fil où l'on mentionne ton humain (message sans changer le statut).
+      Dans le texte, @pseudo, @equipe ou @sujet ajoute ces personnes au fil.
       --attach <fichier> joint un fichier (répétable).
   humloop cancel <ref>                         Annuler une demande
   humloop files <ref>                          Télécharger les pièces jointes d'une demande et de ses réponses
   humloop inbox                                Ce qu'on demande à ton humain, et les réponses à tes questions
   humloop note "<titre>" "<contenu>" [--tags a,b]  Ajouter au savoir commun
-  humloop members                              Membres de l'équipe
+  humloop members                              Membres, projets, qui décide quoi, dépôts GitHub
+  humloop ticket <ref> [--title "<titre>"]     Faire d'un fil un ticket GitHub du dépôt de son projet
+  humloop ticket "<titre>" "<description>" [--project <nom>]   Créer un ticket GitHub
+  humloop tickets [--project <nom>]            Tickets GitHub ouverts du projet
   humloop whoami                               Vérifier la connexion
 EOF
 }
@@ -136,7 +142,9 @@ render() {
         local decision body
         decision=$(jq -r ".replies[$i].decision // empty" <<<$json)
         body=$(jq -r ".replies[$i].body // empty" <<<$json)
-        print -r -- "<humloop-reply from=\"$from\" request=\"$ref\" status=\"$st\"${decision:+ decision=\"$decision\"}>"
+        local comment
+        comment=$(jq -r ".replies[$i].comment // empty" <<<$json)
+        print -r -- "<humloop-reply from=\"$from\" request=\"$ref\" status=\"$st\"${decision:+ decision=\"$decision\"}${comment:+ comment=\"true\"}>"
         [[ -n $body ]] && fence $body
         [[ -z $body && $st == refused ]] && print -r -- "(refusé sans commentaire)"
         [[ -z $body && $decision == accept ]] && print -r -- "(accepté sans commentaire)"
@@ -169,6 +177,14 @@ cmd_members() {
   local r; api GET /v1/members || fail; r=$BODY
   jq -r '.[] | "\(.handle)\t\(.name)\(if .me then "  (toi)" else "" end)"' <<<$r
   print -r -- "@equipe"$'\t'"Toute l'équipe (la première réponse l'emporte)"
+  api GET /v1/projects || return 0; r=$BODY
+  (( $(jq length <<<$r) > 0 )) || return 0
+  print -r -- ""
+  print -r -- "Tes projets :"
+  jq -r '.[] | "- \(.name) (--project \(.slug)) : \(.members | join(", "))"
+    + (if (.deciders | length) > 0 then "\n    qui décide : " + (.deciders | map("\(.topic) → \(.handle)") | join(", ")) else "" end)
+    + (if .repo then "\n    dépôt GitHub : \(.repo) (tickets : humloop tickets --project \(.slug))" else "" end)' <<<$r
+  print -r -- "Pour une décision, adresse la question au sujet : humloop ask <sujet> \"…\" --project <projet>."
 }
 
 project_name() {
@@ -207,7 +223,8 @@ cmd_ask() {
   if [[ $st == awaiting_author ]]; then
     print -r -- "Demande $ref créée. Elle attend la validation de ton humain dans l'app Humloop avant de partir ($(jq -r .approvalReason <<<$r))."
   else
-    print -r -- "Demande $ref envoyée à $to."
+    local decides=$(jq -r '.decides // empty' <<<$r)
+    print -r -- "Demande $ref envoyée à $(jq -r '.to // empty' <<<$r)${decides:+ (décide : $decides)}."
   fi
   if $wait; then cmd_wait $ref; else print -r -- "Pour attendre la réponse : humloop wait $ref (en arrière-plan)"; fi
 }
@@ -279,7 +296,18 @@ cmd_reply() {
   for f in "${files[@]}"; do ids+=("$(upload "$f")") || exit 1; done
   api GET /v1/requests/$ref || fail; r=$BODY
   me=$(whoami_handle)
-  if [[ $(jq -r .from <<<$r) == "$me" ]]; then
+  local rto=$(jq -r .to <<<$r) rst=$(jq -r .status <<<$r) rfrom=$(jq -r .from <<<$r)
+  if [[ $rfrom != "$me" && $rst == pending && ( $rto == "$me" || $rto == equipe ) ]]; then
+    :  # demande adressée à mon humain : réponse ci-dessous
+  elif [[ $rfrom != "$me" ]]; then
+    # Fil où mon humain est mentionné, ou déjà répondu : un message qui ne change pas le statut.
+    [[ -z $decision ]] && ! $ask || die "--ask, --accept et --refuse ne valent que pour une demande en attente adressée à ton humain."
+    payload=$(jq -nc --arg b "$body" '{body:$b, attachments:$ARGS.positional}' --args "${ids[@]}")
+    api POST /v1/requests/$ref/comment "$payload" || fail
+    print -r -- "Message ajouté au fil $ref, au nom de ton humain."
+    return 0
+  fi
+  if [[ $rfrom == "$me" ]]; then
     # Ma propre question : je réponds à la précision demandée, la balle repart chez le destinataire.
     payload=$(jq -nc --arg b "$body" '{body:$b, attachments:$ARGS.positional}' --args "${ids[@]}")
     api POST /v1/requests/$ref/followup "$payload" || fail
@@ -328,6 +356,12 @@ cmd_inbox() {
       print -r -- "Pour répondre à sa place, seulement s'il te le demande : humloop reply <ref> \"…\" (--ask pour demander une précision)."
       print -r -- $NOTICE
     fi
+    local m=$(jq '.mentions // [] | length' <<<$r)
+    if (( m > 0 )); then
+      print -r -- "On mentionne ton humain dans $m fil(s) :"
+      jq -r '.mentions[] | "- [\(.ref)] \(.mentionedByName // .mentionedBy) · fil de \(.fromName // .from) à \(.toName // .to)\(if .projectName then " · " + .projectName else "" end) : \(.body)\(if (.replies // []) | length > 0 then "\n    dernier message (\(.replies[-1].fromName // .replies[-1].from)) : " + (.replies[-1].body // "") else "" end)"' <<<$r | while IFS= read -r line; do fence "$line"; done
+      print -r -- "Fil complet : humloop status <ref>. Répondre dans le fil (s'il te le demande) : humloop reply <ref> \"…\"."
+    fi
   fi
   if (( n == 0 )); then
     $hook || print -r -- "Aucune nouvelle réponse à tes questions."
@@ -338,6 +372,37 @@ cmd_inbox() {
     render "$(jq -c ".updates[$i]" <<<$r)"
     print -r -- "Question d'origine ($(jq -r ".updates[$i].ref" <<<$r)) : $(fence "$(jq -r ".updates[$i].body" <<<$r)")"
   done
+}
+
+cmd_ticket() {
+  (( $# >= 1 )) || die "usage : humloop ticket <ref> [--title …] | humloop ticket \"<titre>\" \"<description>\" [--project <nom>]"
+  local r payload title=''
+  if [[ $1 =~ '^r_[a-z0-9]{5}$' ]]; then
+    local ref=$1; shift
+    [[ ${1:-} == --title ]] && title=${2:-}
+    payload=$(jq -nc --arg t "$title" 'if $t == "" then {} else {title:$t} end')
+    api POST /v1/requests/$ref/ticket "$payload" || fail; r=$BODY
+  else
+    local desc=${2:-} project=$(project_name)
+    title=$1; shift; (( $# )) && shift
+    while (( $# )); do
+      case $1 in --project) project=${2:-}; shift ;; *) die "option inconnue : $1" ;; esac
+      shift
+    done
+    payload=$(jq -nc --arg t "$title" --arg b "$desc" --arg p "$project" '{title:$t, body:$b, project:$p}')
+    api POST /v1/tickets "$payload" || fail; r=$BODY
+  fi
+  print -r -- "Ticket #$(jq -r .number <<<$r)$([[ $(jq -r '.existing // false' <<<$r) == true ]] && print ' (déjà créé)') : $(jq -r .url <<<$r)"
+}
+
+cmd_tickets() {
+  local project=$(project_name) r
+  [[ ${1:-} == --project ]] && project=${2:-}
+  api GET "/v1/tickets?project=$(jq -rn --arg p "$project" '$p|@uri')" || fail; r=$BODY
+  print -r -- "Tickets ouverts de $(jq -r .project <<<$r) ($(jq -r .repo <<<$r)) :"
+  jq -r '.tickets[] | "- #\(.number) \(.title)\(if (.assignees|length) > 0 then " · " + (.assignees|join(", ")) else "" end)\(if (.labels|length) > 0 then " [" + (.labels|join(", ")) + "]" else "" end)\n    \(.url)"' <<<$r | while IFS= read -r line; do fence "$line"; done
+  [[ $(jq '.tickets | length' <<<$r) == 0 ]] && print -r -- "(aucun)"
+  print -r -- $NOTICE
 }
 
 cmd_search() {
@@ -378,6 +443,8 @@ case $sub in
   search) cmd_search "$@" ;;
   note) cmd_note "$@" ;;
   members) cmd_members ;;
+  ticket) cmd_ticket "$@" ;;
+  tickets) cmd_tickets "$@" ;;
   whoami) cmd_whoami ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
